@@ -30,7 +30,9 @@ A vLLM-style LLM inference engine, built from scratch to learn inference in dept
 
 ## 4. Target Model
 
-Default: a small Llama-style model so iteration is fast. Proposed: **Qwen3-0.6B** or **Llama-3.2-1B** (both use RMSNorm, RoPE, GQA, SwiGLU).
+**Qwen3-1.7B** (`Qwen/Qwen3-1.7B`, bf16, ~3.8 GB, stored in `models/Qwen3-1.7B`, git-ignored). A standard dense transformer: 28 layers, hidden 2048, 16 query heads / 8 KV heads (GQA), head_dim 128, RMSNorm, RoPE, SwiGLU, tied embeddings.
+
+**Why not Qwen3.5-2B:** it is a hybrid (18 of 24 layers are Gated DeltaNet linear attention with recurrent state, 6 are full attention) and multimodal, with an attention output gate, partial/multimodal RoPE and MTP. That would complicate the KV cache, paged memory and prefix caching phases. It is a good later stretch phase for hybrid-model support.
 
 * Load weights from `safetensors` directly. Do not use `transformers` for the forward pass.
 * Hugging Face `transformers` is allowed only as a **reference oracle** for correctness tests and baseline benchmarks.
@@ -143,7 +145,7 @@ inference_engine/
 
 ## 11. Open Decisions
 
-1. **Target model:** Qwen3-0.6B or Llama-3.2-1B? (Llama may need gated HF access.)
+1. ~~Target model~~ Decided: Qwen3-1.7B.
 2. **Python version:** keep 3.14 or drop to 3.12/3.13 if PyTorch wheels are missing.
 3. **GPU access:** which provider and when, since phases 10+ depend on it.
 4. **Dtype for early phases:** fp32 for exact reference matching, then bf16/fp16.
