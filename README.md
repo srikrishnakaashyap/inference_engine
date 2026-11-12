@@ -1,157 +1,77 @@
 # inference-engine
 
-A vLLM-style LLM inference engine, built from scratch to learn inference in depth. Every component is hand-written, correctness-checked against a reference, and benchmarked as it is added.
+A vLLM-style LLM inference engine, built from scratch in PyTorch to learn how inference works. Every component is hand-written, checked for correctness against a reference, and benchmarked as it is added.
 
-> Working rules for the AI assistant live in [`CLAUDE.md`](CLAUDE.md). It guides but does not write the engine code.
+> **Status: early.** Phase 0 (reference and baseline) is done. The engine itself is not built yet, so there is nothing to serve. See the [roadmap](ROADMAP.md).
 
-## 1. Goals
+## What this is
 
-1. Understand inference end to end: model forward pass, KV cache, batching, scheduling, memory management, kernels, quantization, speculative decoding, parallelism, serving.
-2. Build a working engine that serves a real open-weights model and exposes an OpenAI-style API.
-3. Measure the effect of each optimization with a reproducible benchmark and write down why the numbers came out the way they did.
+* A learning project: the aim is understanding, not matching vLLM's performance.
+* Target model: [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B), a dense GQA transformer.
+* Planned: forward pass, KV cache, sampling, batching, continuous batching, paged attention, prefix caching, and an OpenAI-compatible API. GPU-only work (kernels, CUDA graphs, quantization, tensor parallelism) comes later on rented hardware.
+* Hugging Face `transformers` is used only as a **reference oracle** for tests and baselines, not for the forward pass.
 
-## 2. Non-Goals
+Full plan, requirements and exit criteria: [`ROADMAP.md`](ROADMAP.md).
 
-* Training or fine-tuning.
-* Beating vLLM in absolute performance. The aim is to understand the gap, not close it.
-* Supporting many model architectures. One model family is enough.
-* Production hardening (auth, multi-tenant isolation, autoscaling).
+## Current status
 
-## 3. Environment and Constraints
-
-| Item | Current | Notes |
-|---|---|---|
-| Dev machine | Apple M5 Pro, arm64, 48 GB unified memory | PyTorch MPS and CPU only. No CUDA, no Triton. |
-| Python | 3.14 (`.python-version`) | Verify the PyTorch wheel supports 3.14 before depending on it. Fall back to 3.12 or 3.13 if not. |
-| Package manager | `uv` | `pyproject.toml` + `uv.lock` |
-| GPU work | Not yet available | Rent an NVIDIA GPU (e.g. A10/L4/A100/H100) for the kernel and CUDA-graph phases. |
-
-**Consequence:** phases that are hardware-independent (model, KV cache, sampling, scheduler, paged memory management, prefix caching, serving) are built and verified locally. Phases that need CUDA (Triton/CUDA attention kernels, CUDA graphs, FP8, tensor parallelism) are deferred to a rented GPU box, and the code must keep the device backend swappable.
-
-## 4. Target Model
-
-**Qwen3-1.7B** (`Qwen/Qwen3-1.7B`, bf16, ~3.8 GB, stored in `models/Qwen3-1.7B`, git-ignored). A standard dense transformer: 28 layers, hidden 2048, 16 query heads / 8 KV heads (GQA), head_dim 128, RMSNorm, RoPE, SwiGLU, tied embeddings.
-
-**Why not Qwen3.5-2B:** it is a hybrid (18 of 24 layers are Gated DeltaNet linear attention with recurrent state, 6 are full attention) and multimodal, with an attention output gate, partial/multimodal RoPE and MTP. That would complicate the KV cache, paged memory and prefix caching phases. It is a good later stretch phase for hybrid-model support.
-
-* Load weights from `safetensors` directly. Do not use `transformers` for the forward pass.
-* Hugging Face `transformers` is allowed only as a **reference oracle** for correctness tests and baseline benchmarks.
-* Later: a second, larger model (e.g. 7-8B) on a rented GPU for realistic benchmarks and tensor parallelism.
-
-## 5. Functional Requirements
-
-| ID | Requirement |
+| Phase | State |
 |---|---|
-| F1 | Load weights and tokenizer for the target model from a local directory. |
-| F2 | Hand-written forward pass (embedding, RMSNorm, RoPE, GQA attention, SwiGLU MLP, LM head). |
-| F3 | Greedy generation matching the reference token for token. |
-| F4 | KV cache with separate prefill and decode paths. |
-| F5 | Sampling: temperature, top-k, top-p, seeded determinism, stop tokens, max length. |
-| F6 | Batched generation over multiple concurrent requests. |
-| F7 | Continuous (iteration-level) batching with a request queue and a scheduler. |
-| F8 | Paged KV cache: block allocator, per-sequence block tables, preemption. |
-| F9 | Chunked prefill and a configurable scheduling policy. |
-| F10 | Prefix caching (shared blocks across requests). |
-| F11 | Streaming token output. |
-| F12 | OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming). |
-| F13 | Optimizations added incrementally and individually toggleable by flag: fused/flash/paged attention kernels, CUDA graphs, quantization (weight-only, KV cache), speculative decoding, tensor parallelism. |
+| 0. HF reference and baseline | Done |
+| 1. Naive forward pass (no cache) | Next |
+| 2+ | See [roadmap](ROADMAP.md) |
 
-## 6. Non-Functional Requirements
+**Baseline** (HF `generate`, Qwen3-1.7B, fp32, MPS on Apple M5 Pro, batch size 1, greedy): about 28-30 tok/s decode and about 0.08-0.13 s prefill for short prompts. These are rough single-run numbers. Details and caveats: [`notes/phase0-hf-baseline.md`](notes/phase0-hf-baseline.md).
 
-| ID | Requirement |
-|---|---|
-| N1 | **Correctness first.** Every phase must pass a correctness test against the reference before its benchmarks count. |
-| N2 | **Reproducibility.** Benchmarks run from a single command, with fixed seeds, recorded config, git commit and hardware. |
-| N3 | **Toggleable optimizations.** Each optimization is behind a flag so before/after comparisons run on the same code. |
-| N4 | **Device abstraction.** Model and cache code must not hardcode a device (CPU, MPS, CUDA). |
-| N5 | **Observability.** Per-request timing (queue, prefill, decode), tokens/s, and memory usage are logged. |
-| N6 | **Readable over clever.** The code exists to be learned from. |
+## Getting started
 
-## 7. Correctness Strategy
+Requires [`uv`](https://docs.astral.sh/uv/) and Python 3.14. The reference scripts currently target Apple Silicon (MPS).
 
-* **Logit match:** for fixed prompts, compare per-position logits with the HF reference within a stated tolerance (per dtype).
-* **Token match:** greedy output must be identical to the reference for N test prompts.
-* **Invariants:** allocator never double-frees or leaks blocks; a sequence's output is independent of which other sequences share its batch; prefix-cached output equals uncached output.
-* **Quality checks** for lossy optimizations (quantization, speculative decoding with sampling): perplexity or task-eval delta against the unoptimized engine.
+```sh
+# install dependencies
+uv sync
 
-## 8. Benchmark Specification
+# download the model weights (about 3.8 GB, git-ignored)
+hf download Qwen/Qwen3-1.7B --local-dir models/Qwen3-1.7B
 
-**Metrics**
+# generate reference tokens and timings with Hugging Face (writes results/results.ndjson)
+uv run python tests/model_testing.py
 
-* Throughput (output tokens/s, requests/s)
-* TTFT (time to first token)
-* TPOT / inter-token latency
-* End-to-end latency at p50 / p95 / p99
-* Peak memory, KV cache capacity, max concurrent sequences
-* Utilization (achieved bandwidth and FLOPs versus hardware peak)
+# measure fp32 logit noise between CPU and MPS
+uv run python tests/noise_floor.py
+```
 
-**Workloads**
+The `inference-engine generate` CLI exists as a stub and raises `NotImplementedError` until the engine is built.
 
-* *Offline:* fixed batch of prompts, measure max throughput.
-* *Online:* Poisson arrivals at several request rates, measure latency distributions.
-* Prompt/output length distributions are fixed and documented (short chat, long prompt, mixed). A shared-prefix workload is used for prefix caching.
-
-**Method**
-
-* Warmup runs, then repeated measurements with variance reported.
-* Correct device synchronization before timing.
-* One change at a time against a recorded baseline.
-* Compare against HF `generate` (and optionally vLLM on the GPU box) to calibrate.
-* Each result is logged with date, commit, hardware, config, numbers and a short interpretation.
-
-## 9. Roadmap and Exit Criteria
-
-| Phase | Scope | Exit criteria | Env |
-|---|---|---|---|
-| 0 | Setup: env, weights, tokenizer, HF reference + baseline benchmark | HF baseline numbers recorded | Mac |
-| 1 | Naive forward pass, no cache | Logits match reference | Mac |
-| 2 | KV cache (prefill/decode) | Tokens match; speedup measured | Mac |
-| 3 | Sampling | Seeded determinism test passes | Mac |
-| 4 | Static batching | Batch outputs equal single-request outputs | Mac |
-| 5 | Continuous batching + scheduler | Throughput beats static batching on mixed lengths | Mac |
-| 6 | Paged KV cache | Allocator invariants hold; memory waste quantified | Mac |
-| 7 | Chunked prefill + scheduling policy | TTFT/TPOT trade-off curves | Mac |
-| 8 | Prefix caching | Identical outputs; speedup on shared-prefix workload | Mac |
-| 9 | Serving layer (async, streaming, OpenAI API) | Load test passes | Mac |
-| 10 | Attention kernels (paged, flash-style, flash-decoding) | Match reference; bandwidth analysis | GPU |
-| 11 | CUDA graphs, `torch.compile`, op fusion | Launch overhead reduction measured | GPU |
-| 12 | Quantization (weight-only, KV, FP8) | Quality delta and speedup reported | GPU (partly Mac) |
-| 13 | Speculative decoding | Acceptance rate and speedup reported | Mac / GPU |
-| 14 | Tensor parallelism (optional: PP, disaggregated prefill/decode) | Multi-GPU scaling measured | multi-GPU |
-| 15 | Stretch: structured output, LoRA serving, MoE | TBD | TBD |
-
-Phases 0 to 9 can all be done on the Mac.
-
-## 10. Proposed Repository Layout
+## Repository layout
 
 ```
 inference_engine/
 ├── README.md
-├── CLAUDE.md
+├── ROADMAP.md          # goals, requirements, phases, benchmark spec
+├── CLAUDE.md           # working rules for AI coding assistants
 ├── pyproject.toml
 ├── src/inference_engine/
-│   ├── model/          # weights loading, layers, forward pass
-│   ├── cache/          # KV cache, block allocator, prefix cache
-│   ├── scheduler/      # request queue, batching policy
-│   ├── sampling/
+│   ├── cli.py          # CLI entry point (stub)
+│   ├── device/         # device selection and synchronization helpers
+│   ├── model/          # weight loading, layers, forward pass (in progress)
+│   ├── cache/          # KV cache, block allocator, prefix cache (planned)
+│   ├── scheduler/      # request queue, batching policy (planned)
+│   ├── sampling/       # (planned)
 │   ├── kernels/        # custom attention and other kernels (GPU phases)
-│   ├── engine.py       # ties model, cache and scheduler together
-│   └── server/         # async API layer
-├── tests/              # correctness tests vs reference
+│   └── server/         # async API layer (planned)
+├── tests/              # reference scripts and correctness tests
 ├── benchmarks/         # harness, workloads, scripts
-├── results/            # logged benchmark results (one file per run)
+├── results/            # logged benchmark and reference outputs
 └── notes/              # learning notes, design decisions per phase
 ```
 
-## 11. Open Decisions
+## Principles
 
-1. ~~Target model~~ Decided: Qwen3-1.7B.
-2. **Python version:** keep 3.14 or drop to 3.12/3.13 if PyTorch wheels are missing.
-3. **GPU access:** which provider and when, since phases 10+ depend on it.
-4. **Dtype for early phases:** fp32 for exact reference matching, then bf16/fp16.
-5. **Server framework:** FastAPI/uvicorn versus a lighter option.
-6. **Reference oracle scope:** HF only, or also vLLM on the GPU box for benchmark calibration.
+* **Correctness first.** A faster engine that gives different outputs is a bug until proven otherwise.
+* **One change at a time**, each benchmarked against a recorded baseline.
+* **Readable over clever.** The code exists to be learned from.
 
-## 12. Status
+## Contributing and AI assistants
 
-- [ ] Phase 0
+This is a personal learning project, so the code is written by hand by the author. Rules for AI coding assistants (mentor role, no engine code generation) live in [`CLAUDE.md`](CLAUDE.md).
