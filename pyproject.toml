@@ -4,7 +4,13 @@ version = "0.1.0"
 description = "A vLLM-style LLM inference engine built from scratch for learning."
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "accelerate>=1.15.0",
+    "safetensors>=0.8.0",
+    "tokenizers>=0.23.3",
+    "torch>=2.15.0",
+    "transformers>=5.22.2",
+]
 
 [project.scripts]
 inference-engine = "inference_engine.cli:main"
